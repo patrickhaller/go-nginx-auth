@@ -1,0 +1,15 @@
+Port  = "127.0.0.1:9000"
+ImapPort = 143
+LogFile = "STDERR"
+AuditFile = "STDERR"
+Debug = true
+LdapBase = "dc=example,dc=com"
+LdapHost = "ldap.example.com."
+LdapPort        = 389
+LdapSkipTLS       = true
+LdapBindDN       = ""
+LdapBindPassword  = ""
+LdapUserFilter   = "(uid=%s)"
+LdapGroupFilter   =  "(memberUid=%s)"
+LdapAttributes  =  [ "givenName", "sn", "mailHost", "uid" ]
+DecapitalizeUserNames = true

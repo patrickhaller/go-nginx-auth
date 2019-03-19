@@ -1,2 +1,7 @@
 # go-nginx-auth
-LDAP authentication and proxy routing for NGINX's mail module
+LDAP authentication end-point for NGINX's [mail](https://nginx.org/en/docs/mail/ngx_mail_core_module.html) module
+
+
+```
+auth_http localhost:9000/auth
+```
