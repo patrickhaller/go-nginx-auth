@@ -1,7 +1,14 @@
 package main
 
+/*
+ Authenticate users for nginx mail
+ https://nginx.org/en/docs/mail/ngx_mail_auth_http_module.html
+*/
+
 import (
+	"errors"
 	"flag"
+	"fmt"
 	"net"
 	"net/http"
 	"os"
@@ -23,6 +30,7 @@ var cfg struct {
 	AuditFile             string
 	Debug                 bool
 	DecapitalizeUserNames bool
+	StripDomains          bool
 	LdapBase              string
 	LdapHost              string
 	LdapPort              int
@@ -34,41 +42,102 @@ var cfg struct {
 	LdapSkipTLS           bool
 	LdapUseSSL            bool
 	LdapServerName        string
+	OkNets                []string
+	DNSBlacklists         []string
 }
 
+var okNets [](*net.IPNet)
+
 func readConfig() {
-	configfile := flag.String("cf", "/usr/local/etc/go-nginx-auth.toml", "TOML config file")
+	configfile := flag.String("cf", "./cf.toml", "TOML config file")
 	flag.Parse()
 	if _, err := os.Stat(*configfile); err != nil {
-		slog.P("Config file `%s' is inaccessible: %v", *configfile, err)
+		slog.F("Config file `%s' is inaccessible: %v", *configfile, err)
 	}
 
 	if _, err := toml.DecodeFile(*configfile, &cfg); err != nil {
-		slog.P("Config file `%s' failed to parse: %v", *configfile, err)
+		slog.F("Config file `%s' failed to parse: %v", *configfile, err)
+	}
+
+	if cfg.ImapPort == "" {
+		slog.F("Config file `%v' has no imap port", *configfile)
+	}
+
+	for n := range cfg.OkNets {
+		_, cidr, err := net.ParseCIDR(cfg.OkNets[n])
+		if err == nil {
+			okNets = append(okNets, cidr)
+		} else {
+			slog.P("failed to parse OkNet `%v'", cfg.OkNets[n])
+		}
 	}
 }
 
-func getLdap(username, pw string) (bool, map[string]string) {
+func getLdapMailHost(username, pw string) (bool, string) {
 	slog.D("user %s ldap start", username)
 	client := ldap.LDAPClient{}
 	if err := confix.Confix("Ldap", &cfg, &client); err != nil {
 		slog.P("confix failed: `%v'", err)
-		return false, nil
+		return false, ""
 	}
 	defer client.Close()
 
 	ok, attrs, err := client.Authenticate(username, pw)
 	if err != nil {
 		slog.P("ldap error authenticating user `%s': %+v", username, err)
-		return false, nil
+		return false, ""
 	}
 	if ok {
 		slog.D("ldap auth success for user: `%s'", username)
-		return true, attrs
+		return true, attrs["mailHost"]
 	}
 
 	slog.P("ldap auth failed for user `%s'", username)
-	return false, nil
+	return false, ""
+}
+
+func isBlacklisted(rip string) bool {
+	octets := strings.Split(rip, ".")
+	var buf strings.Builder
+	for i := len(octets) - 1; i >= 0; i-- {
+		buf.WriteString(octets[i])
+		buf.WriteString(".")
+	}
+	qip := buf.String()
+
+	for i := range cfg.DNSBlacklists {
+		q := fmt.Sprintf("%s%s", qip, cfg.DNSBlacklists[i])
+		slog.D("blacklist query for `%v'", q)
+		addrs, _ := net.LookupHost(q)
+		if len(addrs) > 0 {
+			slog.P("IP is blacklisted `%v' with `%v'", q, addrs)
+			return true
+		}
+	}
+	return false
+}
+
+func checkRemoteIP(rip string) error {
+	if len(rip) == 0 {
+		return nil
+	}
+
+	ip := net.ParseIP(rip)
+	if ip == nil {
+		return fmt.Errorf("not a parseable IP: `%v'", rip)
+	}
+
+	for n := range okNets {
+		if okNets[n].Contains(ip) {
+			return nil
+		}
+	}
+
+	if isBlacklisted(rip) {
+		return errors.New("blacklisted")
+	}
+
+	return nil
 }
 
 func router(w http.ResponseWriter, r *http.Request) {
@@ -76,37 +145,51 @@ func router(w http.ResponseWriter, r *http.Request) {
 
 	username := r.Header.Get("Auth-User")
 	password := r.Header.Get("Auth-Pass")
+	remoteip := r.Header.Get("Client-IP")
+
+	fail := func(comment string, logcomment string) {
+		slog.P("%v `%v' %s `%s'", remoteip, username, comment, logcomment)
+		w.Header().Set("Auth-Status", comment)
+		w.Header().Set("Auth-Wait", "3")
+	}
+
+	if err := checkRemoteIP(remoteip); err != nil {
+		fail(err.Error(), "")
+		return
+	}
 
 	if username == "" || password == "" {
-		w.Header().Set("Auth-Status", "Invalid username or password")
+		fail("Invalid username or password", "zero-length")
 		return
+	}
+
+	idx := strings.Index(username, "@")
+	if cfg.StripDomains == true && idx != -1 {
+		username = username[0:idx]
 	}
 
 	if cfg.DecapitalizeUserNames == true {
 		username = strings.ToLower(username)
 	}
 
-	ok, attrs := getLdap(username, password)
-	mailHost := attrs["mailHost"]
-	if mailHost == "" {
-		slog.P("no mailHost for user %v", username)
-		w.Header().Set("Auth-Status", "No mail host defined")
+	ok, mailHost := getLdapMailHost(username, password)
+	if !ok {
+		fail("Invalid username or password", "")
 		return
 	}
 
-	if !ok {
-		w.Header().Set("Auth-Status", "Invalid username or password")
+	if mailHost == "" {
+		fail("No mail host defined", "")
 		return
 	}
 
 	ipv4, err := net.LookupHost(mailHost)
 	if err != nil {
-		slog.P("hostname lookup for %v failed", mailHost)
-		w.Header().Set("Auth-Status", "DNS Temporary Failure")
+		fail("DNS Temporary Failure", mailHost)
 		return
 	}
 
-	slog.P("routing user %v to host %v", username, mailHost)
+	slog.P("%v `%v' routing user to `%v'", remoteip, username, mailHost)
 	w.Header().Set("Auth-Status", "OK")
 	w.Header().Set("Auth-Port", cfg.ImapPort)
 	w.Header().Set("Auth-Server", ipv4[0])

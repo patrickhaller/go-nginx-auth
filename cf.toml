@@ -13,3 +13,5 @@ LdapUserFilter   = "(uid=%s)"
 LdapGroupFilter   =  "(memberUid=%s)"
 LdapAttributes  =  [ "givenName", "sn", "mailHost", "uid" ]
 DecapitalizeUserNames = true
+OkNets = [ "10.0.0.0/8" ]
+DNSBlacklists = [ "sbl.spamhaus.org", "xbl.spamhaus.org" ]
